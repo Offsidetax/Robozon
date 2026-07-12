@@ -150,23 +150,60 @@ float traceRay(const float3& rayOrigin, const float3& rayDir, const BVH& bvh) {
     return closest_t;
 }
 
-// Обновленная сигнатура renderDepthMap
-void renderDepthMap(int width, int height, const BVH& bvh) {
-    std::vector<float> depthBuffer(width * height);
-    float3 cameraOrigin = { 0.0f, 0.0f, -500.0f };
+// Константа для перевода градусов в радианы
+const float PI = 3.14159265359f;
 
+// Обновленная функция рендеринга с моделью наклонной камеры
+void renderDepthMap(int width, int height, const BVH& bvh) {
+    std::vector<float> heightMap(width * height, 0.0f); // Заполняем нулями (уровень ленты)
+
+    // 1. Физические параметры установки (в миллиметрах и градусах)
+    float camHeight = 1100.0f;     // Высота по вашей схеме
+    float pitchAngleDeg = 30.0f;   // Угол наклона от вертикали (30 градусов)
+    float fovDeg = 60.0f;          // Угол обзора камеры (Field of View)
+
+    // Перевод угла в радианы
+    float pitchRad = pitchAngleDeg * (PI / 180.0f);
+
+    // 2. Вычисление позиции камеры
+    // Сдвигаем камеру назад по оси Y (вдоль конвейера), чтобы при наклоне она смотрела в центр (0,0,0)
+    float3 cameraOrigin = { 0.0f, -camHeight * std::tan(pitchRad), camHeight };
+    float3 cameraTarget = { 0.0f, 0.0f, 0.0f }; // Точка на ленте конвейера
+    float3 globalUp = { 0.0f, 0.0f, 1.0f }; // Ось Z смотрит вверх
+
+    // 3. Построение базиса камеры (Look-At)
+    float3 forward = normalize(cameraTarget - cameraOrigin);
+    float3 right = normalize(cross(forward, globalUp));
+    float3 up = cross(right, forward);
+
+    // 4. Масштаб проекции экрана
+    float aspect = static_cast<float>(width) / height;
+    float scale = std::tan((fovDeg * 0.5f) * (PI / 180.0f));
+
+    // 5. Трассировка
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
+            // NDC координаты [-1, 1]
             float ndcX = (2.0f * (x + 0.5f) / width) - 1.0f;
             float ndcY = 1.0f - (2.0f * (y + 0.5f) / height);
 
-            float3 rayDir = normalize({ ndcX, ndcY, 1.0f }); // Нормализация добавлена
-            depthBuffer[y * width + x] = traceRay(cameraOrigin, rayDir, bvh);
+            // Направление луча в мировом пространстве
+            float3 rayDir = normalize((ndcX * aspect * scale) * right + (ndcY * scale) * up + forward);
+
+            // Трассируем луч
+            float t = traceRay(cameraOrigin, rayDir, bvh);
+
+            // 6. Магия перевода: вычисляем физическую координату Z (высоту над лентой)
+            if (t < 1e29f) { // Если попали в объект
+                float3 hitPoint = cameraOrigin + t * rayDir; // Точка пересечения в 3D
+                heightMap[y * width + x] = hitPoint.z;       // Сохраняем абсолютную ВЫСОТУ в мм
+            }
         }
     }
 
-    std::ofstream file("depth_output.bin", std::ios::binary);
-    file.write(reinterpret_cast<const char*>(depthBuffer.data()), depthBuffer.size() * sizeof(float));
+    // Сохраняем карту ВЫСОТ
+    std::ofstream file("height_output.bin", std::ios::binary);
+    file.write(reinterpret_cast<const char*>(heightMap.data()), heightMap.size() * sizeof(float));
 }
 
 // Быстрый загрузчик бинарного STL

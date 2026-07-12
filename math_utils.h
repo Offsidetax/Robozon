@@ -18,6 +18,14 @@ inline float3 operator-(const float3& a, const float3& b) {
     return { a.x - b.x, a.y - b.y, a.z - b.z };
 }
 
+inline float3 operator+(const float3& a, const float3& b) {
+    return { a.x + b.x, a.y + b.y, a.z + b.z };
+}
+
+inline float3 operator*(float s, const float3& v) {
+    return { s * v.x, s * v.y, s * v.z };
+}
+
 inline float dot(const float3& a, const float3& b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
 }
