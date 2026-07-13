@@ -4,12 +4,16 @@ project(RobozonRaycaster)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Ищем установленный OpenCV в системе
+find_package(OpenCV REQUIRED)
+
 if(MSVC)
-    # Добавлен флаг /openmp для поддержки многопоточности в Visual Studio
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2 /arch:AVX2 /fp:fast /openmp")
 else()
-    # Добавлен флаг -fopenmp для GCC/Clang
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -ffast-math -fopenmp")
 endif()
 
 add_executable(Robozon main.cpp)
+
+# Подключаем библиотеки OpenCV к нашему проекту
+target_link_libraries(Robozon ${OpenCV_LIBS})
