@@ -153,57 +153,110 @@ float traceRay(const float3& rayOrigin, const float3& rayDir, const BVH& bvh) {
 // Константа для перевода градусов в радианы
 const float PI = 3.14159265359f;
 
-// Обновленная функция рендеринга с моделью наклонной камеры
+// Обновленная функция рендеринга с OpenMP и расчетом габаритов
 void renderDepthMap(int width, int height, const BVH& bvh) {
-    std::vector<float> heightMap(width * height, 0.0f); // Заполняем нулями (уровень ленты)
+    std::vector<float> heightMap(width * height, 0.0f);
 
-    // 1. Физические параметры установки (в миллиметрах и градусах)
-    float camHeight = 1100.0f;     // Высота по вашей схеме
-    float pitchAngleDeg = 30.0f;   // Угол наклона от вертикали (30 градусов)
-    float fovDeg = 60.0f;          // Угол обзора камеры (Field of View)
-
-    // Перевод угла в радианы
+    float camHeight = 1100.0f;
+    float pitchAngleDeg = 30.0f;
+    float fovDeg = 60.0f;
     float pitchRad = pitchAngleDeg * (PI / 180.0f);
 
-    // 2. Вычисление позиции камеры
-    // Сдвигаем камеру назад по оси Y (вдоль конвейера), чтобы при наклоне она смотрела в центр (0,0,0)
     float3 cameraOrigin = { 0.0f, -camHeight * std::tan(pitchRad), camHeight };
-    float3 cameraTarget = { 0.0f, 0.0f, 0.0f }; // Точка на ленте конвейера
-    float3 globalUp = { 0.0f, 0.0f, 1.0f }; // Ось Z смотрит вверх
+    float3 cameraTarget = { 0.0f, 0.0f, 0.0f };
+    float3 globalUp = { 0.0f, 0.0f, 1.0f };
 
-    // 3. Построение базиса камеры (Look-At)
     float3 forward = normalize(cameraTarget - cameraOrigin);
     float3 right = normalize(cross(forward, globalUp));
     float3 up = cross(right, forward);
 
-    // 4. Масштаб проекции экрана
     float aspect = static_cast<float>(width) / height;
     float scale = std::tan((fovDeg * 0.5f) * (PI / 180.0f));
 
-    // 5. Трассировка
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            // NDC координаты [-1, 1]
-            float ndcX = (2.0f * (x + 0.5f) / width) - 1.0f;
-            float ndcY = 1.0f - (2.0f * (y + 0.5f) / height);
+    // Глобальные переменные для физических габаритов (в миллиметрах)
+    float globalMinX = 1e30f, globalMinY = 1e30f;
+    float globalMaxX = -1e30f, globalMaxY = -1e30f, globalMaxZ = -1e30f;
+    bool hitAnything = false;
 
-            // Направление луча в мировом пространстве
-            float3 rayDir = normalize((ndcX * aspect * scale) * right + (ndcY * scale) * up + forward);
+    // Включаем многопоточность OpenMP
+#pragma omp parallel
+    {
+        // Локальные переменные для каждого потока (чтобы избежать конфликтов доступа к памяти)
+        float localMinX = 1e30f, localMinY = 1e30f;
+        float localMaxX = -1e30f, localMaxY = -1e30f, localMaxZ = -1e30f;
+        bool localHit = false;
 
-            // Трассируем луч
-            float t = traceRay(cameraOrigin, rayDir, bvh);
+#pragma omp for
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                float ndcX = (2.0f * (x + 0.5f) / width) - 1.0f;
+                float ndcY = 1.0f - (2.0f * (y + 0.5f) / height);
+                float3 rayDir = normalize((ndcX * aspect * scale) * right + (ndcY * scale) * up + forward);
 
-            // 6. Магия перевода: вычисляем физическую координату Z (высоту над лентой)
-            if (t < 1e29f) { // Если попали в объект
-                float3 hitPoint = cameraOrigin + t * rayDir; // Точка пересечения в 3D
-                heightMap[y * width + x] = hitPoint.z;       // Сохраняем абсолютную ВЫСОТУ в мм
+                float t = traceRay(cameraOrigin, rayDir, bvh);
+
+                if (t < 1e29f) {
+                    float3 hitPoint = cameraOrigin + t * rayDir;
+                    heightMap[y * width + x] = hitPoint.z;
+
+                    // Обновляем границы товара
+                    localMinX = std::min(localMinX, hitPoint.x);
+                    localMaxX = std::max(localMaxX, hitPoint.x);
+                    localMinY = std::min(localMinY, hitPoint.y);
+                    localMaxY = std::max(localMaxY, hitPoint.y);
+                    localMaxZ = std::max(localMaxZ, hitPoint.z);
+                    localHit = true;
+                }
+            }
+        }
+
+        // Безопасно объединяем локальные данные потоков в глобальные переменные
+#pragma omp critical
+        {
+            if (localHit) {
+                globalMinX = std::min(globalMinX, localMinX);
+                globalMaxX = std::max(globalMaxX, localMaxX);
+                globalMinY = std::min(globalMinY, localMinY);
+                globalMaxY = std::max(globalMaxY, localMaxY);
+                globalMaxZ = std::max(globalMaxZ, localMaxZ);
+                hitAnything = true;
             }
         }
     }
 
-    // Сохраняем карту ВЫСОТ
+    // Сохраняем результат
     std::ofstream file("height_output.bin", std::ios::binary);
     file.write(reinterpret_cast<const char*>(heightMap.data()), heightMap.size() * sizeof(float));
+
+    // Анализ габаритов и вывод результата
+    if (hitAnything) {
+        float objLength = globalMaxX - globalMinX;
+        float objWidth = globalMaxY - globalMinY;
+        float objHeight = globalMaxZ; // Высота считается от ленты (0.0)
+
+        std::cout << "\n--- RESULTS OF SCAN ---\n";
+        std::cout << "Dimensions of object (L x W x H): "
+            << objLength << " x " << objWidth << " x " << objHeight << " mm\n";
+
+        // Ориентация на ленте может быть любой, поэтому сортируем длину и ширину для проверки
+        float maxXY = std::max(objLength, objWidth);
+        float minXY = std::min(objLength, objWidth);
+
+        // Проверка по правилам хакатона
+        if (maxXY > 450.0f || minXY > 320.0f || objHeight > 320.0f) {
+            std::cout << "STATUS: [REJECTED] Exceeds maximum dimensions (450x320x320)\n";
+        }
+        else if (maxXY < 10.0f || minXY < 10.0f || objHeight < 10.0f) {
+            std::cout << "STATUS: [REJECTED] Item is smaller than minimum dimensions (10x10x10)\n";
+        }
+        else {
+            std::cout << "STATUS: [PRE-APPROVED] Dimensions within limits. Form check required.\n";
+        }
+        std::cout << "-------------------------------\n";
+    }
+    else {
+        std::cout << "STATUS: The feed is empty; no products were found.\n";
+    }
 }
 
 // Быстрый загрузчик бинарного STL
@@ -231,13 +284,46 @@ bool loadBinarySTL(const std::string& filename, std::vector<Triangle>& outTriang
     return true;
 }
 
+// Функция для автоматического выравнивания модели на ленте (Z=0) и центрирования (X=0, Y=0)
+void normalizeModel(std::vector<Triangle>& triangles) {
+    if (triangles.empty()) return;
+
+    float minX = 1e30f, minY = 1e30f, minZ = 1e30f;
+    float maxX = -1e30f, maxY = -1e30f, maxZ = -1e30f;
+
+    // 1. Находим габариты исходной CAD-модели
+    for (const auto& tri : triangles) {
+        float3 verts[3] = { tri.v0, tri.v1, tri.v2 };
+        for (int i = 0; i < 3; i++) {
+            minX = std::min(minX, verts[i].x); maxX = std::max(maxX, verts[i].x);
+            minY = std::min(minY, verts[i].y); maxY = std::max(maxY, verts[i].y);
+            minZ = std::min(minZ, verts[i].z); maxZ = std::max(maxZ, verts[i].z);
+        }
+    }
+
+    // 2. Вычисляем смещение: центр X и Y в 0, а самый низ (minZ) поднимаем на 0 (уровень ленты)
+    float offsetX = -(minX + maxX) * 0.5f;
+    float offsetY = -(minY + maxY) * 0.5f;
+    float offsetZ = -minZ;
+
+    // 3. Сдвигаем все вершины модели в пространстве
+    for (auto& tri : triangles) {
+        tri.v0.x += offsetX; tri.v0.y += offsetY; tri.v0.z += offsetZ;
+        tri.v1.x += offsetX; tri.v1.y += offsetY; tri.v1.z += offsetZ;
+        tri.v2.x += offsetX; tri.v2.y += offsetY; tri.v2.z += offsetZ;
+    }
+}
+
 int main() {
     BVH bvh;
 
-    // Загрузите тестовую модель объекта сортировки (замените на свой файл)
-    // Если файла нет, можно захардкодить один тестовый треугольник для проверки
     if (loadBinarySTL("test_item.stl", bvh.triangles)) {
         std::cout << "Loaded " << bvh.triangles.size() << " triangles.\n";
+
+        // ВЫЗЫВАЕМ НОРМАЛИЗАЦИЮ ПЕРЕД ПОСТРОЕНИЕМ BVH
+        normalizeModel(bvh.triangles);
+        std::cout << "Model normalized (centered and placed on Z=0).\n";
+
     }
     else {
         std::cout << "STL not found. Using fallback triangle.\n";
@@ -250,7 +336,7 @@ int main() {
 
     std::cout << "Rendering depth map...\n";
     renderDepthMap(800, 600, bvh);
-    std::cout << "Done! Output saved to depth_output.bin\n";
+    std::cout << "Done! Output saved to height_output.bin\n";
 
     return 0;
 }

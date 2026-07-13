@@ -4,13 +4,12 @@ project(RobozonRaycaster)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Проверяем, какой компилятор используется
 if(MSVC)
-    # Флаги для Microsoft Visual C++
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2 /arch:AVX2 /fp:fast")
+    # Добавлен флаг /openmp для поддержки многопоточности в Visual Studio
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2 /arch:AVX2 /fp:fast /openmp")
 else()
-    # Флаги для GCC / Clang
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -ffast-math")
+    # Добавлен флаг -fopenmp для GCC/Clang
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -ffast-math -fopenmp")
 endif()
 
 add_executable(Robozon main.cpp)
