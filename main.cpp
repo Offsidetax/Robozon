@@ -5,6 +5,7 @@
 #include <cmath>
 #include "math_utils.h"
 #include <windows.h>
+#include <omp.h>
 
 // --- Подключаем OpenCV ---
 #include <opencv2/opencv.hpp>
@@ -242,42 +243,101 @@ ScanResult renderDepthMap(int width, int height, const BVH& bvh) {
     return res;
 }
 
+// Функция симуляции 3D-камеры: возвращает облако точек
+std::vector<float3> scanPointCloud(int width, int height, const BVH& bvh, float3 cameraOrigin, float pitchRad) {
+    std::vector<float3> cloud;
+    const float PI = 3.14159265359f;
+    float fovDeg = 40.0f; // Вертикальный угол обзора
+
+    float3 forward = normalize(float3{ 0.0f, 0.0f, 0.0f } - cameraOrigin);
+    float3 right = normalize(cross(forward, { 0.0f, 0.0f, 1.0f }));
+    float3 up = cross(right, forward);
+
+    float aspect = static_cast<float>(width) / height;
+    float scale = std::tan((fovDeg * 0.5f) * (PI / 180.0f));
+
+#pragma omp parallel
+    {
+        // Локальный вектор для каждого потока, чтобы избежать блокировок
+        std::vector<float3> local_cloud;
+        local_cloud.reserve((width * height) / omp_get_num_threads());
+
+#pragma omp for nowait
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                float ndcX = (2.0f * (x + 0.5f) / width) - 1.0f;
+                float ndcY = 1.0f - (2.0f * (y + 0.5f) / height);
+                float3 rayDir = normalize((ndcX * aspect * scale) * right + (ndcY * scale) * up + forward);
+
+                float t = traceRay(cameraOrigin, rayDir, bvh);
+                if (t < 1e29f) {
+                    local_cloud.push_back(cameraOrigin + t * rayDir);
+                }
+            }
+        }
+
+        // Сливаем локальные векторы в общий массив
+#pragma omp critical
+        {
+            cloud.insert(cloud.end(), local_cloud.begin(), local_cloud.end());
+        }
+    }
+    return cloud;
+}
 
 int main() {
     SetConsoleOutputCP(CP_UTF8);
 
+    // --- ДОБАВЛЕННЫЙ БЛОК ---
     BVH bvh;
-    if (loadBinarySTL("test_item.stl", bvh.triangles)) {
-        std::cout << "Model loaded: " << bvh.triangles.size() << " triangles.\n";
+    std::cout << "Loading STL...\n";
+    // Замени "model.stl" на реальный путь к твоему тестовому файлу
+    if (!loadBinarySTL("test_item.stl", bvh.triangles)) {
+        std::cout << "ERROR: Failed to load STL file.\n";
+        return -1;
     }
-    else {
-        std::cout << "STL not found.\n"; return -1;
-    }
+    // ------------------------
 
     std::cout << "Building BVH...\n";
     bvh.build();
 
-    std::cout << "Rendering Depth Map...\n";
-    ScanResult bounds = renderDepthMap(800, 600, bvh);
+    std::cout << "Scanning Object via Dual Cameras...\n";
 
-    // 1. Сборка облака точек для PCA
-    int numPoints = bvh.triangles.size() * 3;
+    // Параметры установки камер
+    const float PI = 3.14159265359f;
+    float camHeight = 1100.0f;
+    float pitchRad = 60.0f * (PI / 180.0f);
+    float yOffset = camHeight * std::tan(pitchRad);
+
+    // Камера 1 (спереди) и Камера 2 (сзади)
+    float3 cam1Origin = { 0.0f, -yOffset, camHeight };
+    float3 cam2Origin = { 0.0f,  yOffset, camHeight };
+
+    std::vector<float3> cloud1 = scanPointCloud(800, 600, bvh, cam1Origin, pitchRad);
+    std::vector<float3> cloud2 = scanPointCloud(800, 600, bvh, cam2Origin, pitchRad);
+
+    // Объединяем облака
+    std::vector<float3> full_cloud;
+    full_cloud.reserve(cloud1.size() + cloud2.size());
+    full_cloud.insert(full_cloud.end(), cloud1.begin(), cloud1.end());
+    full_cloud.insert(full_cloud.end(), cloud2.begin(), cloud2.end());
+
+    if (full_cloud.empty()) {
+        std::cout << "ERROR: Object not detected on the belt.\n";
+        return -1;
+    }
+    std::cout << "Generated Point Cloud: " << full_cloud.size() << " points.\n";
+
+    // 1. Подготовка данных для PCA ИЗ ОБЛАКА ТОЧЕК (а не из STL)
+    int numPoints = full_cloud.size();
     cv::Mat data_pts(numPoints, 3, CV_32FC1);
-    for (size_t i = 0; i < bvh.triangles.size(); ++i) {
-        data_pts.at<float>(i * 3, 0) = bvh.triangles[i].v0.x;
-        data_pts.at<float>(i * 3, 1) = bvh.triangles[i].v0.y;
-        data_pts.at<float>(i * 3, 2) = bvh.triangles[i].v0.z;
-
-        data_pts.at<float>(i * 3 + 1, 0) = bvh.triangles[i].v1.x;
-        data_pts.at<float>(i * 3 + 1, 1) = bvh.triangles[i].v1.y;
-        data_pts.at<float>(i * 3 + 1, 2) = bvh.triangles[i].v1.z;
-
-        data_pts.at<float>(i * 3 + 2, 0) = bvh.triangles[i].v2.x;
-        data_pts.at<float>(i * 3 + 2, 1) = bvh.triangles[i].v2.y;
-        data_pts.at<float>(i * 3 + 2, 2) = bvh.triangles[i].v2.z;
+    for (int i = 0; i < numPoints; ++i) {
+        data_pts.at<float>(i, 0) = full_cloud[i].x;
+        data_pts.at<float>(i, 1) = full_cloud[i].y;
+        data_pts.at<float>(i, 2) = full_cloud[i].z;
     }
 
-    // 2. Расчет PCA для получения локальных осей объекта
+    // 2. Расчет PCA
     cv::PCA pca(data_pts, cv::Mat(), cv::PCA::DATA_AS_ROW);
     float3 center = { pca.mean.at<float>(0, 0), pca.mean.at<float>(0, 1), pca.mean.at<float>(0, 2) };
 
@@ -316,8 +376,7 @@ int main() {
         return 0;
     }
 
-    // ПРИОРИТЕТ 2: Сканирование 3 ортогональных сечений
-    std::cout << "\n--- FORM ANALYSIS (3 Orthogonal Sections) ---\n";
+    std::cout << "\n--- FORM ANALYSIS (Point Cloud Orthographic Projections) ---\n";
     bool requiresRepackaging = false;
 
     for (int axisIdx = 0; axisIdx < 3; ++axisIdx) {
@@ -328,24 +387,23 @@ int main() {
         int height = static_cast<int>(std::ceil(maxExt[vIdx] - minExt[vIdx])) + 20;
 
         cv::Mat mask(height, width, CV_8UC1, cv::Scalar(0));
-        float3 rayDir = axes[axisIdx];
-        float marginOffset = (maxExt[axisIdx] - minExt[axisIdx]) * 0.5f + 50.0f;
 
-#pragma omp parallel for
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                float localU = minExt[uIdx] + x - 10.0f;
-                float localV = minExt[vIdx] + y - 10.0f;
+        // Проецируем каждую точку облака на локальную 2D-плоскость OBB
+        for (const auto& pt : full_cloud) {
+            float3 d = pt - center;
+            // Координаты точки в базисе PCA (с отступом 10 пикселей от края)
+            float localU = dot(d, axes[uIdx]) - minExt[uIdx] + 10.0f;
+            float localV = dot(d, axes[vIdx]) - minExt[vIdx] + 10.0f;
 
-                // Проекция луча снаружи OBB внутрь
-                float3 rayOrigin = center + (localU * axes[uIdx]) + (localV * axes[vIdx]) - (marginOffset * rayDir);
+            // Защита от выхода за пределы памяти (clamping)
+            int x = std::max(0, std::min(static_cast<int>(localU), width - 1));
+            int y = std::max(0, std::min(static_cast<int>(localV), height - 1));
 
-                if (traceRay(rayOrigin, rayDir, bvh) < 1e29f) {
-                    mask.at<uchar>(y, x) = 255;
-                }
-            }
+            // Закрашиваем точку белым
+            mask.at<uchar>(y, x) = 255;
         }
 
+        // Вызываем твою функцию (морфология склеит точки, а FindContours найдет круг)
         float K = 0.0f;
         if (checkMaskForCircle(mask, K)) {
             std::cout << "Section [" << axisIdx << "] K = " << K << " -> CIRCLE DETECTED\n";
