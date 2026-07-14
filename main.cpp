@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include "math_utils.h"
+#include <windows.h>
 
 // --- Подключаем OpenCV ---
 #include <opencv2/opencv.hpp>
@@ -91,32 +92,6 @@ private:
     }
 };
 
-void normalizeModel(std::vector<Triangle>& triangles) {
-    if (triangles.empty()) return;
-
-    float minX = 1e30f, minY = 1e30f, minZ = 1e30f;
-    float maxX = -1e30f, maxY = -1e30f, maxZ = -1e30f;
-
-    for (const auto& tri : triangles) {
-        float3 verts[3] = { tri.v0, tri.v1, tri.v2 };
-        for (int i = 0; i < 3; i++) {
-            minX = std::min(minX, verts[i].x); maxX = std::max(maxX, verts[i].x);
-            minY = std::min(minY, verts[i].y); maxY = std::max(maxY, verts[i].y);
-            minZ = std::min(minZ, verts[i].z); maxZ = std::max(maxZ, verts[i].z);
-        }
-    }
-
-    float offsetX = -(minX + maxX) * 0.5f;
-    float offsetY = -(minY + maxY) * 0.5f;
-    float offsetZ = -minZ; // Ставим на уровень конвейера (Z=0)
-
-    for (auto& tri : triangles) {
-        tri.v0.x += offsetX; tri.v0.y += offsetY; tri.v0.z += offsetZ;
-        tri.v1.x += offsetX; tri.v1.y += offsetY; tri.v1.z += offsetZ;
-        tri.v2.x += offsetX; tri.v2.y += offsetY; tri.v2.z += offsetZ;
-    }
-}
-
 float traceRay(const float3& rayOrigin, const float3& rayDir, const BVH& bvh) {
     int stack[64];
     int stackPtr = 0;
@@ -144,6 +119,58 @@ float traceRay(const float3& rayOrigin, const float3& rayDir, const BVH& bvh) {
         }
     }
     return closest_t;
+}
+
+
+// Загрузчик бинарного STL
+bool loadBinarySTL(const std::string& filename, std::vector<Triangle>& outTriangles) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file) return false;
+    char header[80];
+    file.read(header, 80);
+    uint32_t numTriangles;
+    file.read(reinterpret_cast<char*>(&numTriangles), sizeof(uint32_t));
+    outTriangles.resize(numTriangles);
+    for (uint32_t i = 0; i < numTriangles; i++) {
+        file.seekg(12, std::ios::cur); // Пропускаем нормаль
+        file.read(reinterpret_cast<char*>(&outTriangles[i].v0), 12);
+        file.read(reinterpret_cast<char*>(&outTriangles[i].v1), 12);
+        file.read(reinterpret_cast<char*>(&outTriangles[i].v2), 12);
+        file.seekg(2, std::ios::cur);
+    }
+    return true;
+}
+
+bool checkMaskForCircle(const cv::Mat& mask, float& K_out) {
+    cv::Mat morphMask;
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+    cv::morphologyEx(mask, morphMask, cv::MORPH_CLOSE, kernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(morphMask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    if (contours.empty()) return false;
+
+    auto largestContour = std::max_element(contours.begin(), contours.end(),
+        [](const auto& a, const auto& b) { return cv::contourArea(a) < cv::contourArea(b); });
+
+    // Описанная окружность (R)
+    cv::Point2f center;
+    float R_out;
+    cv::minEnclosingCircle(*largestContour, center, R_out);
+
+    // Защита от шумовых контуров
+    if (R_out < 5.0f) return false;
+
+    // Вписанная окружность (r)
+    cv::Mat distTransform;
+    cv::distanceTransform(morphMask, distTransform, cv::DIST_L2, 5);
+    double minVal, maxVal;
+    cv::minMaxLoc(distTransform, &minVal, &maxVal);
+    float r_in = static_cast<float>(maxVal);
+
+    K_out = r_in / R_out;
+    return K_out >= 0.8f;
 }
 
 // Структура для возврата габаритов
@@ -215,107 +242,13 @@ ScanResult renderDepthMap(int width, int height, const BVH& bvh) {
     return res;
 }
 
-// === НОВАЯ ЛОГИКА OpenCV ===
-// Ортографическое сканирование сверху вниз для получения чистого 2D сечения
-bool checkCircularCrossSection(const BVH& bvh, const ScanResult& bounds) {
-    // 1 пиксель = 1 мм. Добавляем рамку 10 мм для чистоты
-    int minX = static_cast<int>(std::floor(bounds.minX)) - 10;
-    int maxX = static_cast<int>(std::ceil(bounds.maxX)) + 10;
-    int minY = static_cast<int>(std::floor(bounds.minY)) - 10;
-    int maxY = static_cast<int>(std::ceil(bounds.maxY)) + 10;
-
-    int width = maxX - minX;
-    int height = maxY - minY;
-
-    if (width <= 0 || height <= 0) return false;
-
-    cv::Mat mask(height, width, CV_8UC1, cv::Scalar(0));
-
-    // Сканируем строго сверху вниз (ортографическая проекция)
-#pragma omp parallel for
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            float3 rayOrigin = { static_cast<float>(minX + x), static_cast<float>(minY + y), bounds.maxZ + 50.0f };
-            float3 rayDir = { 0.0f, 0.0f, -1.0f }; // Луч бьет перпендикулярно ленте
-
-            if (traceRay(rayOrigin, rayDir, bvh) < 1e29f) {
-                mask.at<uchar>(y, x) = 255;
-            }
-        }
-    }
-
-    // Морфологическое закрытие для устранения мелкого шума на границах
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
-    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
-
-    // Поиск внешних контуров
-    std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-    if (contours.empty()) return false;
-
-    // Находим самый большой контур
-    auto largestContour = std::max_element(contours.begin(), contours.end(),
-        [](const auto& a, const auto& b) { return cv::contourArea(a) < cv::contourArea(b); });
-
-    // 1. Описанная окружность (R)
-    cv::Point2f center;
-    float R_out;
-    cv::minEnclosingCircle(*largestContour, center, R_out);
-
-    // 2. Вписанная окружность (r) через преобразование расстояний (Distance Transform)
-    cv::Mat distTransform;
-    cv::distanceTransform(mask, distTransform, cv::DIST_L2, 5);
-    double minVal, maxVal;
-    cv::Point minLoc, maxLoc;
-    cv::minMaxLoc(distTransform, &minVal, &maxVal, &minLoc, &maxLoc);
-    float r_in = static_cast<float>(maxVal);
-
-    if (R_out < 1.0f) return false;
-
-    // 3. Вычисление коэффициента К
-    float K = r_in / R_out;
-
-    std::cout << "\n--- FORM ANALYSIS (OpenCV) ---\n";
-    std::cout << "Radius of the circumcircle (R): " << R_out << " mm\n";
-    std::cout << "Radius of the inscribed circle (r): " << r_in << " mm\n";
-    std::cout << "Coefficient K (r/R): " << K << "\n";
-
-    // Создаем отладочное изображение (очень поможет на защите проекта!)
-    cv::Mat debugImg;
-    cv::cvtColor(mask, debugImg, cv::COLOR_GRAY2BGR);
-    cv::circle(debugImg, center, R_out, cv::Scalar(0, 0, 255), 2); // Красная - описанная
-    cv::circle(debugImg, maxLoc, r_in, cv::Scalar(0, 255, 0), 2);  // Зеленая - вписанная
-    cv::imwrite("cross_section_debug.png", debugImg);
-
-    return K >= 0.8f;
-}
-
-// Загрузчик бинарного STL
-bool loadBinarySTL(const std::string& filename, std::vector<Triangle>& outTriangles) {
-    std::ifstream file(filename, std::ios::binary);
-    if (!file) return false;
-    char header[80];
-    file.read(header, 80);
-    uint32_t numTriangles;
-    file.read(reinterpret_cast<char*>(&numTriangles), sizeof(uint32_t));
-    outTriangles.resize(numTriangles);
-    for (uint32_t i = 0; i < numTriangles; i++) {
-        file.seekg(12, std::ios::cur); // Пропускаем нормаль
-        file.read(reinterpret_cast<char*>(&outTriangles[i].v0), 12);
-        file.read(reinterpret_cast<char*>(&outTriangles[i].v1), 12);
-        file.read(reinterpret_cast<char*>(&outTriangles[i].v2), 12);
-        file.seekg(2, std::ios::cur);
-    }
-    return true;
-}
 
 int main() {
-    BVH bvh;
+    SetConsoleOutputCP(CP_UTF8);
 
+    BVH bvh;
     if (loadBinarySTL("test_item.stl", bvh.triangles)) {
-        normalizeModel(bvh.triangles);
-        std::cout << "Model loaded and normalized.\n";
+        std::cout << "Model loaded: " << bvh.triangles.size() << " triangles.\n";
     }
     else {
         std::cout << "STL not found.\n"; return -1;
@@ -327,33 +260,109 @@ int main() {
     std::cout << "Rendering Depth Map...\n";
     ScanResult bounds = renderDepthMap(800, 600, bvh);
 
-    if (bounds.hit) {
-        float objLength = bounds.maxX - bounds.minX;
-        float objWidth = bounds.maxY - bounds.minY;
-        float objHeight = bounds.maxZ;
+    // 1. Сборка облака точек для PCA
+    int numPoints = bvh.triangles.size() * 3;
+    cv::Mat data_pts(numPoints, 3, CV_32FC1);
+    for (size_t i = 0; i < bvh.triangles.size(); ++i) {
+        data_pts.at<float>(i * 3, 0) = bvh.triangles[i].v0.x;
+        data_pts.at<float>(i * 3, 1) = bvh.triangles[i].v0.y;
+        data_pts.at<float>(i * 3, 2) = bvh.triangles[i].v0.z;
 
-        float maxXY = std::max(objLength, objWidth);
-        float minXY = std::min(objLength, objWidth);
+        data_pts.at<float>(i * 3 + 1, 0) = bvh.triangles[i].v1.x;
+        data_pts.at<float>(i * 3 + 1, 1) = bvh.triangles[i].v1.y;
+        data_pts.at<float>(i * 3 + 1, 2) = bvh.triangles[i].v1.z;
 
-        std::cout << "\n--- SCAN RESULTS ---\n";
-        std::cout << "Facility dimensions (L x W x H): " << objLength << " x " << objWidth << " x " << objHeight << " мм\n";
+        data_pts.at<float>(i * 3 + 2, 0) = bvh.triangles[i].v2.x;
+        data_pts.at<float>(i * 3 + 2, 1) = bvh.triangles[i].v2.y;
+        data_pts.at<float>(i * 3 + 2, 2) = bvh.triangles[i].v2.z;
+    }
 
-        if (maxXY > 450.0f || minXY > 320.0f || objHeight > 320.0f) {
-            std::cout << "STATUS: [DOES NOT FIT] Too large.\n";
-        }
-        else if (maxXY < 10.0f || minXY < 10.0f || objHeight < 10.0f) {
-            std::cout << "STATUS: [DOES NOT FIT] Too small.\n";
-        }
-        else {
-            // Если габариты в норме, запускаем проверку формы OpenCV
-            bool isCircular = checkCircularCrossSection(bvh, bounds);
-            if (isCircular) {
-                std::cout << "STATUS: [REQUIRES REPACKAGING] Circular cross-section detected.\n";
-            }
-            else {
-                std::cout << "STATUS: [SUITABLE FOR SORTING] Successful.\n";
-            }
+    // 2. Расчет PCA для получения локальных осей объекта
+    cv::PCA pca(data_pts, cv::Mat(), cv::PCA::DATA_AS_ROW);
+    float3 center = { pca.mean.at<float>(0, 0), pca.mean.at<float>(0, 1), pca.mean.at<float>(0, 2) };
+
+    std::vector<float3> axes(3);
+    for (int i = 0; i < 3; ++i) {
+        axes[i] = { pca.eigenvectors.at<float>(i, 0), pca.eigenvectors.at<float>(i, 1), pca.eigenvectors.at<float>(i, 2) };
+    }
+
+    // 3. Вычисление габаритов Oriented Bounding Box (OBB)
+    float minExt[3] = { 1e30f, 1e30f, 1e30f };
+    float maxExt[3] = { -1e30f, -1e30f, -1e30f };
+
+    for (int i = 0; i < numPoints; ++i) {
+        float3 pt = { data_pts.at<float>(i, 0), data_pts.at<float>(i, 1), data_pts.at<float>(i, 2) };
+        float3 d = pt - center;
+        for (int j = 0; j < 3; ++j) {
+            float proj = dot(d, axes[j]);
+            minExt[j] = std::min(minExt[j], proj);
+            maxExt[j] = std::max(maxExt[j], proj);
         }
     }
+
+    std::vector<float> dims = { maxExt[0] - minExt[0], maxExt[1] - minExt[1], maxExt[2] - minExt[2] };
+    std::sort(dims.rbegin(), dims.rend()); // Сортируем: Length, Width, Height
+
+    std::cout << "\n--- DIMENSIONS (OBB) ---\n";
+    std::cout << "Extracted dimensions: " << dims[0] << " x " << dims[1] << " x " << dims[2] << " mm\n";
+
+    // ПРИОРИТЕТ 1: Габаритный контроль
+    if (dims[0] > 450.0f || dims[1] > 320.0f || dims[2] > 320.0f) {
+        std::cout << "STATUS: [NOT SUITABLE FOR DIMENSIONAL SORTING] The object is too large.\n";
+        return 0;
+    }
+    if (dims[2] < 10.0f) {
+        std::cout << "STATUS: [NOT SUITABLE FOR SIZE-BASED SORTING] The object is too small.\n";
+        return 0;
+    }
+
+    // ПРИОРИТЕТ 2: Сканирование 3 ортогональных сечений
+    std::cout << "\n--- FORM ANALYSIS (3 Orthogonal Sections) ---\n";
+    bool requiresRepackaging = false;
+
+    for (int axisIdx = 0; axisIdx < 3; ++axisIdx) {
+        int uIdx = (axisIdx + 1) % 3;
+        int vIdx = (axisIdx + 2) % 3;
+
+        int width = static_cast<int>(std::ceil(maxExt[uIdx] - minExt[uIdx])) + 20;
+        int height = static_cast<int>(std::ceil(maxExt[vIdx] - minExt[vIdx])) + 20;
+
+        cv::Mat mask(height, width, CV_8UC1, cv::Scalar(0));
+        float3 rayDir = axes[axisIdx];
+        float marginOffset = (maxExt[axisIdx] - minExt[axisIdx]) * 0.5f + 50.0f;
+
+#pragma omp parallel for
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                float localU = minExt[uIdx] + x - 10.0f;
+                float localV = minExt[vIdx] + y - 10.0f;
+
+                // Проекция луча снаружи OBB внутрь
+                float3 rayOrigin = center + (localU * axes[uIdx]) + (localV * axes[vIdx]) - (marginOffset * rayDir);
+
+                if (traceRay(rayOrigin, rayDir, bvh) < 1e29f) {
+                    mask.at<uchar>(y, x) = 255;
+                }
+            }
+        }
+
+        float K = 0.0f;
+        if (checkMaskForCircle(mask, K)) {
+            std::cout << "Section [" << axisIdx << "] K = " << K << " -> CIRCLE DETECTED\n";
+            requiresRepackaging = true;
+            break;
+        }
+        else {
+            std::cout << "Section [" << axisIdx << "] K = " << K << " -> OK\n";
+        }
+    }
+
+    if (requiresRepackaging) {
+        std::cout << "\nSTATUS: [NOT SUITABLE FOR SORTING WITHOUT ADDITIONAL PACKAGING]\n";
+    }
+    else {
+        std::cout << "\nSTATUS: [SUITABLE FOR SORTING]\n";
+    }
+
     return 0;
 }
