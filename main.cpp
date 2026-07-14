@@ -316,6 +316,17 @@ int main() {
     std::vector<float3> cloud1 = scanPointCloud(800, 600, bvh, cam1Origin, pitchRad);
     std::vector<float3> cloud2 = scanPointCloud(800, 600, bvh, cam2Origin, pitchRad);
 
+    // --- ДОБАВЛЕННЫЙ БЛОК: СОХРАНЕНИЕ ДЛЯ PYTHON ---
+    std::cout << "Saving point clouds for Python visualization...\n";
+    std::ofstream out1("cloud1.bin", std::ios::binary);
+    if (out1) out1.write(reinterpret_cast<const char*>(cloud1.data()), cloud1.size() * sizeof(float3));
+    out1.close();
+
+    std::ofstream out2("cloud2.bin", std::ios::binary);
+    if (out2) out2.write(reinterpret_cast<const char*>(cloud2.data()), cloud2.size() * sizeof(float3));
+    out2.close();
+    // -----------------------------------------------
+
     // Объединяем облака
     std::vector<float3> full_cloud;
     full_cloud.reserve(cloud1.size() + cloud2.size());
@@ -376,47 +387,80 @@ int main() {
         return 0;
     }
 
-    std::cout << "\n--- FORM ANALYSIS (Point Cloud Orthographic Projections) ---\n";
+    std::cout << "\n--- FORM ANALYSIS (Cross-Section Slicing) ---\n";
     bool requiresRepackaging = false;
 
+    // Настройки слайсера
+    const int NUM_SLICES = 10; // Количество слоев (сечений) вдоль каждой оси
+    const int MIN_POINTS_IN_SLICE = 50; // Отсекаем слои, где слишком мало точек (шум)
+
     for (int axisIdx = 0; axisIdx < 3; ++axisIdx) {
+        if (requiresRepackaging) break; // Прерываем внешний цикл, если круг уже найден
+
         int uIdx = (axisIdx + 1) % 3;
         int vIdx = (axisIdx + 2) % 3;
+
+        // Вычисляем толщину одного слоя
+        float sliceThickness = (maxExt[axisIdx] - minExt[axisIdx]) / NUM_SLICES;
+
+        // Защита от деления на ноль для абсолютно плоских объектов
+        if (sliceThickness < 1.0f) continue;
 
         int width = static_cast<int>(std::ceil(maxExt[uIdx] - minExt[uIdx])) + 20;
         int height = static_cast<int>(std::ceil(maxExt[vIdx] - minExt[vIdx])) + 20;
 
-        cv::Mat mask(height, width, CV_8UC1, cv::Scalar(0));
+        // Создаем массив масок (стопку сечений) для текущей оси
+        std::vector<cv::Mat> masks(NUM_SLICES);
+        for (int i = 0; i < NUM_SLICES; ++i) {
+            masks[i] = cv::Mat(height, width, CV_8UC1, cv::Scalar(0));
+        }
 
-        // Проецируем каждую точку облака на локальную 2D-плоскость OBB
+        // 1-Й ПРОХОД: Распределяем все точки облака по соответствующим слоям (Сложность O(N))
         for (const auto& pt : full_cloud) {
             float3 d = pt - center;
-            // Координаты точки в базисе PCA (с отступом 10 пикселей от края)
+
+            // localW - это глубина точки вдоль оси нарезки
+            float localW = dot(d, axes[axisIdx]);
             float localU = dot(d, axes[uIdx]) - minExt[uIdx] + 10.0f;
             float localV = dot(d, axes[vIdx]) - minExt[vIdx] + 10.0f;
 
-            // Защита от выхода за пределы памяти (clamping)
+            // Вычисляем индекс слоя, в который попадает точка
+            int sliceIdx = static_cast<int>((localW - minExt[axisIdx]) / sliceThickness);
+
+            // Защита (clamping) индекса массива
+            sliceIdx = std::max(0, std::min(sliceIdx, NUM_SLICES - 1));
+
             int x = std::max(0, std::min(static_cast<int>(localU), width - 1));
             int y = std::max(0, std::min(static_cast<int>(localV), height - 1));
 
-            // Закрашиваем точку белым
-            mask.at<uchar>(y, x) = 255;
+            // Закрашиваем пиксель в конкретном слое
+            masks[sliceIdx].at<uchar>(y, x) = 255;
         }
 
-        // Вызываем твою функцию (морфология склеит точки, а FindContours найдет круг)
-        float K = 0.0f;
-        if (checkMaskForCircle(mask, K)) {
-            std::cout << "Section [" << axisIdx << "] K = " << K << " -> CIRCLE DETECTED\n";
-            requiresRepackaging = true;
-            break;
-        }
-        else {
-            std::cout << "Section [" << axisIdx << "] K = " << K << " -> OK\n";
+        // 2-Й ПРОХОД: Анализ каждого слоя с помощью морфологии
+        for (int i = 0; i < NUM_SLICES; ++i) {
+            // Оптимизация: пропускаем пустые или почти пустые слои
+            if (cv::countNonZero(masks[i]) < MIN_POINTS_IN_SLICE) {
+                continue;
+            }
+
+            float K = 0.0f;
+            if (checkMaskForCircle(masks[i], K)) {
+                std::cout << "Axis [" << axisIdx << "] Slice [" << i + 1 << "/" << NUM_SLICES << "] K = " << K << " -> CIRCLE DETECTED\n";
+                requiresRepackaging = true;
+                break; // Круг найден - дальше текущую ось не проверяем
+            }
+            else {
+                // Опциональный вывод успешных слоев (полезно для отладки)
+                std::cout << "Axis [" << axisIdx << "] Slice [" << i + 1 << "/" << NUM_SLICES << "] K = " << K << " -> OK\n";
+            }
         }
     }
 
+    // Итоговый вывод статуса
     if (requiresRepackaging) {
         std::cout << "\nSTATUS: [NOT SUITABLE FOR SORTING WITHOUT ADDITIONAL PACKAGING]\n";
+        std::cout << "REASON: Circular cross-section detected in object profile.\n";
     }
     else {
         std::cout << "\nSTATUS: [SUITABLE FOR SORTING]\n";
