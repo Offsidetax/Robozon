@@ -374,6 +374,22 @@ int main() {
     std::vector<float> dims = { maxExt[0] - minExt[0], maxExt[1] - minExt[1], maxExt[2] - minExt[2] };
     std::sort(dims.rbegin(), dims.rend()); // Сортируем: Length, Width, Height
 
+    // --- ДОБАВЛЕННЫЙ БЛОК: СОХРАНЕНИЕ OBB ДЛЯ PYTHON ---
+    std::ofstream obb_file("obb_data.txt");
+    if (obb_file) {
+        // Пишем центр
+        obb_file << center.x << " " << center.y << " " << center.z << "\n";
+        // Пишем 3 вектора осей
+        for (int i = 0; i < 3; ++i) {
+            obb_file << axes[i].x << " " << axes[i].y << " " << axes[i].z << "\n";
+        }
+        // Пишем минимумы и максимумы
+        obb_file << minExt[0] << " " << minExt[1] << " " << minExt[2] << "\n";
+        obb_file << maxExt[0] << " " << maxExt[1] << " " << maxExt[2] << "\n";
+        obb_file.close();
+    }
+    // ---------------------------------------------------
+
     std::cout << "\n--- DIMENSIONS (OBB) ---\n";
     std::cout << "Extracted dimensions: " << dims[0] << " x " << dims[1] << " x " << dims[2] << " mm\n";
 
